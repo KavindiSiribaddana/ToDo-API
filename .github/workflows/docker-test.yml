@@ -1,0 +1,40 @@
+name: Docker Build Test
+
+on:
+  push:
+    branches:
+      - release
+  workflow_dispatch:
+
+jobs:
+  docker-build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Download source code from GitHub repo
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # Step 2: Build the Spring Boot project using Maven
+      - name: Build Spring Boot app
+        run: mvn clean package -DskipTests
+
+      # Step 3: Build Docker image using the Dockerfile
+      - name: Build Docker image
+        run: docker build -t todo-api:test .
+
+      # Step 4: Run Docker container in the GitHub Actions runner
+      - name: Run Docker container
+        run: docker run -d -p 8080:8080 --name todo-api todo-api:test
+
+      # Step 5: Wait for Spring Boot app to start
+      - name: Wait for app startup
+        run: sleep 20
+
+      # Step 6: Test health endpoint
+      - name: Test health endpoint
+        run: curl -f http://localhost:8080/actuator/health
+
+      # Step 7: Test Todo API endpoint
+      - name: Test Todo API endpoint
+        run: curl -f http://localhost:8080/api/todos
