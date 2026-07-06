@@ -35,6 +35,6 @@ jobs:
       - name: Test health endpoint
         run: curl -f http://localhost:8080/actuator/health
 
-      # Step 7: Test Todo API endpoint
+      # Step 7: Test API endpoint
       - name: Test Todo API endpoint
         run: curl -f http://localhost:8080/api/todos
