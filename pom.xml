@@ -41,6 +41,12 @@
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
+        <!-- Exposes operational endpoints such as GET /actuator/health for CI and deployments. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <!-- In-memory database. Data resets when the application restarts. -->
         <dependency>
             <groupId>com.h2database</groupId>
