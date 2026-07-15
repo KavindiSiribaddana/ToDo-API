@@ -1,0 +1,9 @@
+# Do not send build/cache/IDE files to Docker context.
+target/*
+!target/*.jar
+.git/
+.gitignore
+.idea/
+*.iml
+.DS_Store
+*.log
