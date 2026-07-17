@@ -1,169 +1,170 @@
-/*
- Jenkins CI/CD pipeline for the Spring Boot Todo API.
-
- What this pipeline does:
- 1. Checks out source code from GitHub.
- 2. Builds and tests the Java 17 Spring Boot project using Maven.
- 3. Builds a Docker image.
- 4. Logs in to Amazon ECR.
- 5. Pushes the Docker image to ECR.
- 6. Registers a new ECS task definition revision.
- 7. Updates an existing ECS service so ECS deploys the new task.
-
- Jenkins agent requirements:
- - Java 17
- - Maven
- - Docker CLI/daemon access
- - AWS CLI v2
- - Jenkins credential named aws-jenkins-user
-   Type: Username with password
-   Username: AWS_ACCESS_KEY_ID
-   Password: AWS_SECRET_ACCESS_KEY
-*/
-
 pipeline {
     agent any
 
     environment {
-        // Replace these values with your AWS/account details.
         AWS_REGION = 'ap-south-1'
-        AWS_ACCOUNT_ID = '123456789012'
+        AWS_ACCOUNT_ID = '435556621081'
 
-        // ECR repository name. Example final image:
-        // 123456789012.dkr.ecr.ap-south-1.amazonaws.com/todo-api:15-a1b2c3d
         ECR_REPOSITORY = 'todo-api'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-        // Existing ECS cluster/service names.
-        // Create these once in AWS Console or AWS CLI before running the deployment stage.
         ECS_CLUSTER = 'todo-api-cluster'
         ECS_SERVICE = 'todo-api-service'
-
-        // Must match the container name inside aws/task-definition-template.json.
+        TASK_FAMILY = 'todo-api-task'
         CONTAINER_NAME = 'todo-api'
 
-        // CloudWatch log group used by the ECS task definition.
-        CLOUDWATCH_LOG_GROUP = '/ecs/todo-api'
+        TASK_EXECUTION_ROLE_ARN = "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole"
+        LOG_GROUP = '/ecs/todo-api'
     }
 
     stages {
         stage('Checkout') {
             steps {
-                // For a Multibranch Pipeline, Jenkins automatically checks out the branch.
-                // For a normal Pipeline job, configure the GitHub repo in Jenkins job settings.
+                echo 'Checking out source code from GitHub...'
                 checkout scm
             }
         }
 
-        stage('Build and Test') {
+        stage('Build Spring Boot App') {
             steps {
-                // clean  : removes old build output
-                // verify : compiles, runs tests, and packages the Spring Boot JAR
-                sh 'mvn -B clean verify'
+                echo 'Building Java 17 Spring Boot application...'
+                sh 'mvn clean package -DskipTests'
+                sh 'ls -lh target/*.jar'
             }
         }
 
         stage('Prepare Image Tag') {
             steps {
                 script {
-                    // Short commit hash helps trace which Git commit produced each Docker image.
-                    def shortCommit = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortCommit}"
-                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
-                    env.IMAGE_URI = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
-                    echo "Docker image will be: ${env.IMAGE_URI}"
+                    def gitCommit = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${BUILD_NUMBER}-${gitCommit}"
+                    env.IMAGE_URI = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+                    echo "Image tag: ${IMAGE_TAG}"
+                    echo "Image URI: ${IMAGE_URI}"
                 }
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Docker Build') {
             steps {
-                // Dockerfile copies the JAR from target/*.jar into the runtime image.
-                sh 'docker build -t ${IMAGE_URI} .'
+                echo 'Building Docker image...'
+                sh 'docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .'
+                sh 'docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${IMAGE_URI}'
             }
         }
 
-        stage('Login and Push to ECR') {
+        stage('Push Image to ECR') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'aws-jenkins-user',
-                    usernameVariable: 'AWS_ACCESS_KEY_ID',
-                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                )]) {
-                    sh '''
-                        set -e
+                echo 'Logging in to ECR...'
+                sh '''
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                    | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                '''
 
-                        # Make AWS CLI use the configured region.
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                echo 'Pushing Docker image to ECR...'
+                sh 'docker push ${IMAGE_URI}'
+            }
+        }
 
-                        # Create ECR repository if it does not already exist.
-                        aws ecr describe-repositories --repository-names ${ECR_REPOSITORY} >/dev/null 2>&1 \
-                          || aws ecr create-repository --repository-name ${ECR_REPOSITORY} >/dev/null
+        stage('Create ECS Task Definition JSON') {
+            steps {
+                echo 'Creating ECS task definition file...'
 
-                        # Authenticate Docker to the private ECR registry.
-                        aws ecr get-login-password --region ${AWS_REGION} \
-                          | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                sh '''
+cat > task-definition.json <<EOF
+{
+  "family": "${TASK_FAMILY}",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "${TASK_EXECUTION_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "${CONTAINER_NAME}",
+      "image": "${IMAGE_URI}",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
+EOF
 
-                        # Push the build-specific image tag.
-                        docker push ${IMAGE_URI}
-                    '''
+cat task-definition.json
+'''
+            }
+        }
+
+        stage('Register Task Definition') {
+            steps {
+                echo 'Registering new ECS task definition revision...'
+
+                script {
+                    env.NEW_TASK_DEF_ARN = sh(
+                        script: '''
+                            aws ecs register-task-definition \
+                              --cli-input-json file://task-definition.json \
+                              --region ${AWS_REGION} \
+                              --query 'taskDefinition.taskDefinitionArn' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "New task definition ARN: ${NEW_TASK_DEF_ARN}"
                 }
             }
         }
 
-        stage('Deploy to ECS') {
+        stage('Update ECS Service') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'aws-jenkins-user',
-                    usernameVariable: 'AWS_ACCESS_KEY_ID',
-                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                )]) {
-                    sh '''
-                        set -e
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                echo 'Updating ECS service with new task definition...'
 
-                        # Create CloudWatch log group if it does not already exist.
-                        aws logs create-log-group --log-group-name ${CLOUDWATCH_LOG_GROUP} >/dev/null 2>&1 || true
+                sh '''
+                    aws ecs update-service \
+                      --cluster ${ECS_CLUSTER} \
+                      --service ${ECS_SERVICE} \
+                      --task-definition ${NEW_TASK_DEF_ARN} \
+                      --region ${AWS_REGION}
+                '''
+            }
+        }
 
-                        # Replace placeholders in the ECS task definition template.
-                        sed \
-                          -e "s|<AWS_ACCOUNT_ID>|${AWS_ACCOUNT_ID}|g" \
-                          -e "s|<AWS_REGION>|${AWS_REGION}|g" \
-                          -e "s|<IMAGE_URI>|${IMAGE_URI}|g" \
-                          aws/task-definition-template.json > task-definition.json
+        stage('Wait for ECS Stability') {
+            steps {
+                echo 'Waiting until ECS service becomes stable...'
 
-                        # Register a new ECS task definition revision using the new Docker image.
-                        TASK_DEF_ARN=$(aws ecs register-task-definition \
-                          --cli-input-json file://task-definition.json \
-                          --query 'taskDefinition.taskDefinitionArn' \
-                          --output text)
-
-                        echo "Registered task definition: ${TASK_DEF_ARN}"
-
-                        # Update the ECS service. ECS then starts new tasks using the new revision.
-                        aws ecs update-service \
-                          --cluster ${ECS_CLUSTER} \
-                          --service ${ECS_SERVICE} \
-                          --task-definition ${TASK_DEF_ARN} \
-                          --force-new-deployment >/dev/null
-
-                        # Wait until the ECS service becomes stable.
-                        aws ecs wait services-stable \
-                          --cluster ${ECS_CLUSTER} \
-                          --services ${ECS_SERVICE}
-
-                        echo "Deployment completed successfully."
-                    '''
-                }
+                sh '''
+                    aws ecs wait services-stable \
+                      --cluster ${ECS_CLUSTER} \
+                      --services ${ECS_SERVICE} \
+                      --region ${AWS_REGION}
+                '''
             }
         }
     }
 
     post {
         success {
-            echo "CI/CD completed. Image pushed and ECS service updated: ${IMAGE_URI}"
+            echo 'Pipeline completed successfully. New version deployed to ECS.'
         }
+
         failure {
-            echo 'Pipeline failed. Check the failed stage logs in Jenkins.'
+            echo 'Pipeline failed. Check the failed stage logs above.'
         }
     }
 }
