@@ -1,33 +1,66 @@
+def getSsmParam(String name) {
+    return sh(
+        script: "aws ssm get-parameter --name '${name}' --query 'Parameter.Value' --output text --region ${env.BOOTSTRAP_REGION}",
+        returnStdout: true
+    ).trim()
+}
+
 pipeline {
     agent any
 
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'test', 'prod'],
+            description: 'Target deployment environment'
+        )
+    }
+
     environment {
-        AWS_REGION = 'us-east-1'
-        AWS_ACCOUNT_ID = '435556621081'
-
-        ECR_REPOSITORY = 'todo-api'
-        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-        ECS_CLUSTER = 'todo-api-cluster'
-        ECS_SERVICE = 'todo-api-task-service-tky48ft4'
-        TASK_FAMILY = 'todo-api-task'
-        CONTAINER_NAME = 'todo-api'
-
-        TASK_EXECUTION_ROLE_ARN = "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole"
-        LOG_GROUP = '/ecs/todo-api'
+        // Bootstrap region is needed to read SSM parameters.
+        // This is not secret. You can also set it in Jenkins Global Environment instead.
+        BOOTSTRAP_REGION = 'us-east-1'
     }
 
     stages {
         stage('Checkout') {
             steps {
-                echo 'Checking out source code from GitHub...'
                 checkout scm
+            }
+        }
+
+        stage('Load Deployment Config from SSM') {
+            steps {
+                script {
+                    def basePath = "/todo-api/${params.DEPLOY_ENV}"
+
+                    env.AWS_REGION = getSsmParam("${basePath}/aws-region")
+                    env.AWS_ACCOUNT_ID = sh(
+                        script: "aws sts get-caller-identity --query Account --output text --region ${env.AWS_REGION}",
+                        returnStdout: true
+                    ).trim()
+
+                    env.ECR_REPOSITORY = getSsmParam("${basePath}/ecr-repository")
+                    env.ECS_CLUSTER = getSsmParam("${basePath}/ecs-cluster")
+                    env.ECS_SERVICE = getSsmParam("${basePath}/ecs-service")
+                    env.TASK_FAMILY = getSsmParam("${basePath}/task-family")
+                    env.CONTAINER_NAME = getSsmParam("${basePath}/container-name")
+                    env.LOG_GROUP = getSsmParam("${basePath}/log-group")
+                    env.TASK_EXECUTION_ROLE_ARN = getSsmParam("${basePath}/task-execution-role-arn")
+
+                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+
+                    echo "Deployment environment: ${params.DEPLOY_ENV}"
+                    echo "AWS region: ${env.AWS_REGION}"
+                    echo "ECR repository: ${env.ECR_REPOSITORY}"
+                    echo "ECS cluster: ${env.ECS_CLUSTER}"
+                    echo "ECS service: ${env.ECS_SERVICE}"
+                }
             }
         }
 
         stage('Build Spring Boot App') {
             steps {
-                echo 'Building Java 17 Spring Boot application...'
                 sh 'mvn clean package -DskipTests'
                 sh 'ls -lh target/*.jar'
             }
@@ -38,17 +71,15 @@ pipeline {
                 script {
                     def gitCommit = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
                     env.IMAGE_TAG = "${BUILD_NUMBER}-${gitCommit}"
-                    env.IMAGE_URI = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                    env.IMAGE_URI = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
 
-                    echo "Image tag: ${IMAGE_TAG}"
-                    echo "Image URI: ${IMAGE_URI}"
+                    echo "Image URI: ${env.IMAGE_URI}"
                 }
             }
         }
 
         stage('Docker Build') {
             steps {
-                echo 'Building Docker image...'
                 sh 'docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .'
                 sh 'docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${IMAGE_URI}'
             }
@@ -56,21 +87,17 @@ pipeline {
 
         stage('Push Image to ECR') {
             steps {
-                echo 'Logging in to ECR...'
                 sh '''
                     aws ecr get-login-password --region ${AWS_REGION} \
                     | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                '''
 
-                echo 'Pushing Docker image to ECR...'
-                sh 'docker push ${IMAGE_URI}'
+                    docker push ${IMAGE_URI}
+                '''
             }
         }
 
         stage('Create ECS Task Definition JSON') {
             steps {
-                echo 'Creating ECS task definition file...'
-
                 sh '''
 cat > task-definition.json <<EOF
 {
@@ -111,8 +138,6 @@ cat task-definition.json
 
         stage('Register Task Definition') {
             steps {
-                echo 'Registering new ECS task definition revision...'
-
                 script {
                     env.NEW_TASK_DEF_ARN = sh(
                         script: '''
@@ -125,15 +150,13 @@ cat task-definition.json
                         returnStdout: true
                     ).trim()
 
-                    echo "New task definition ARN: ${NEW_TASK_DEF_ARN}"
+                    echo "New task definition ARN: ${env.NEW_TASK_DEF_ARN}"
                 }
             }
         }
 
         stage('Update ECS Service') {
             steps {
-                echo 'Updating ECS service with new task definition...'
-
                 sh '''
                     aws ecs update-service \
                       --cluster ${ECS_CLUSTER} \
@@ -146,8 +169,6 @@ cat task-definition.json
 
         stage('Wait for ECS Stability') {
             steps {
-                echo 'Waiting until ECS service becomes stable...'
-
                 sh '''
                     aws ecs wait services-stable \
                       --cluster ${ECS_CLUSTER} \
@@ -160,11 +181,10 @@ cat task-definition.json
 
     post {
         success {
-            echo 'Pipeline completed successfully. New version deployed to ECS.'
+            echo "Deployment completed successfully."
         }
-
         failure {
-            echo 'Pipeline failed. Check the failed stage logs above.'
+            echo "Deployment failed. Check the failed stage logs."
         }
     }
 }
