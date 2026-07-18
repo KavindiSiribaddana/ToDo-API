@@ -8,24 +8,54 @@ def getSsmParam(String name) {
 pipeline {
     agent any
 
+    options {
+        // Prevent Jenkins from automatically checking out the branch configured in the job.
+        // We will checkout the selected branch manually.
+        skipDefaultCheckout(true)
+    }
+
     parameters {
         choice(
             name: 'DEPLOY_ENV',
             choices: ['dev', 'test', 'prod'],
-            description: 'Target deployment environment'
+            description: 'Select target deployment environment'
         )
     }
 
     environment {
-        // Bootstrap region is needed to read SSM parameters.
-        // This is not secret. You can also set it in Jenkins Global Environment instead.
         BOOTSTRAP_REGION = 'us-east-1'
+        GIT_REPO_URL = 'https://github.com/KavindiSiribaddana/ToDo-API.git'
     }
 
     stages {
-        stage('Checkout') {
+        stage('Select Branch') {
             steps {
-                checkout scm
+                script {
+                    def branchMap = [
+                        dev : 'main',
+                        test: 'release',
+                        prod: 'release'
+                    ]
+
+                    env.SELECTED_BRANCH = branchMap[params.DEPLOY_ENV]
+
+                    echo "Selected environment: ${params.DEPLOY_ENV}"
+                    echo "Selected branch: ${env.SELECTED_BRANCH}"
+                }
+            }
+        }
+
+        stage('Checkout Selected Branch') {
+            steps {
+                echo "Checking out branch: ${env.SELECTED_BRANCH}"
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.SELECTED_BRANCH}"]],
+                    userRemoteConfigs: [[
+                        url: "${env.GIT_REPO_URL}"
+                    ]]
+                ])
             }
         }
 
@@ -35,6 +65,147 @@ pipeline {
                     def basePath = "/todo-api/${params.DEPLOY_ENV}"
 
                     env.AWS_REGION = getSsmParam("${basePath}/aws-region")
+                    env.AWS_ACCOUNT_ID = sh(
+                        script: "aws sts get-caller-identity --query Account --output text --region ${env.AWS_REGION}",
+                        returnStdout: true
+                    ).trim()
+
+                    env.ECR_REPOSITORY = getSsmParam("${basePath}/ecr-repository")
+                    env.ECS_CLUSTER = getSsmParam("${basePath}/ecs-cluster")
+                    env.ECS_SERVICE = getSsmParam("${basePath}/ecs-service")
+                    env.TASK_FAMILY = getSsmParam("${basePath}/task-family")
+                    env.CONTAINER_NAME = getSsmParam("${basePath}/container-name")
+                    env.LOG_GROUP = getSsmParam("${basePath}/log-group")
+                    env.TASK_EXECUTION_ROLE_ARN = getSsmParam("${basePath}/task-execution-role-arn")
+
+                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+
+                    echo "AWS region: ${env.AWS_REGION}"
+                    echo "ECS cluster: ${env.ECS_CLUSTER}"
+                    echo "ECS service: ${env.ECS_SERVICE}"
+                }
+            }
+        }
+
+        stage('Build Spring Boot App') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+                sh 'ls -lh target/*.jar'
+            }
+        }
+
+        stage('Prepare Image Tag') {
+            steps {
+                script {
+                    def gitCommit = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${params.DEPLOY_ENV}-${BUILD_NUMBER}-${gitCommit}"
+                    env.IMAGE_URI = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
+
+                    echo "Image URI: ${env.IMAGE_URI}"
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh 'docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .'
+                sh 'docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${IMAGE_URI}'
+            }
+        }
+
+        stage('Push Image to ECR') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                    | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                    docker push ${IMAGE_URI}
+                '''
+            }
+        }
+
+        stage('Create ECS Task Definition JSON') {
+            steps {
+                sh '''
+cat > task-definition.json <<EOF
+{
+  "family": "${TASK_FAMILY}",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "${TASK_EXECUTION_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "${CONTAINER_NAME}",
+      "image": "${IMAGE_URI}",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
+EOF
+cat task-definition.json
+'''
+            }
+        }
+
+        stage('Register Task Definition') {
+            steps {
+                script {
+                    env.NEW_TASK_DEF_ARN = sh(
+                        script: '''
+                            aws ecs register-task-definition \
+                              --cli-input-json file://task-definition.json \
+                              --region ${AWS_REGION} \
+                              --query 'taskDefinition.taskDefinitionArn' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "New task definition ARN: ${env.NEW_TASK_DEF_ARN}"
+                }
+            }
+        }
+
+        stage('Update ECS Service') {
+            steps {
+                sh '''
+                    aws ecs update-service \
+                      --cluster ${ECS_CLUSTER} \
+                      --service ${ECS_SERVICE} \
+                      --task-definition ${NEW_TASK_DEF_ARN} \
+                      --region ${AWS_REGION}
+                '''
+            }
+        }
+
+        stage('Wait for ECS Stability') {
+            steps {
+                sh '''
+                    aws ecs wait services-stable \
+                      --cluster ${ECS_CLUSTER} \
+                      --services ${ECS_SERVICE} \
+                      --region ${AWS_REGION}
+                '''
+            }
+        }
+    }
+}                    env.AWS_REGION = getSsmParam("${basePath}/aws-region")
                     env.AWS_ACCOUNT_ID = sh(
                         script: "aws sts get-caller-identity --query Account --output text --region ${env.AWS_REGION}",
                         returnStdout: true
