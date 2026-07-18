@@ -9,7 +9,7 @@ pipeline {
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
         ECS_CLUSTER = 'todo-api-cluster'
-        ECS_SERVICE = 'todo-api-service'
+        ECS_SERVICE = 'todo-api-task-service-tky48ft4'
         TASK_FAMILY = 'todo-api-task'
         CONTAINER_NAME = 'todo-api'
 
