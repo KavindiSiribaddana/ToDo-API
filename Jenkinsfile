@@ -32,7 +32,7 @@ pipeline {
             steps {
                 script {
                     def branchMap = [
-                        dev : 'main',
+                        dev : 'release',
                         test: 'release',
                         prod: 'release'
                     ]
